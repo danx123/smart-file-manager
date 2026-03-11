@@ -236,6 +236,8 @@ An **empty replacement** (nothing between two commas) removes the matched text.
 
 <img width="1365" height="767" alt="Screenshot 2026-03-11 232755" src="https://github.com/user-attachments/assets/e3b9688b-d08d-4333-97a5-0b6a14bc8d70" />
 
+<img width="1365" height="767" alt="Screenshot 2026-03-12 031240" src="https://github.com/user-attachments/assets/d311ca9e-e5e1-468f-bd11-f5c4833becd9" />
+
 
 
 
