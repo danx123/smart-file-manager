@@ -10,7 +10,7 @@
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-0EA5E9?style=flat-square)](https://github.com/danx123/smart-file-manager)
 [![Version](https://img.shields.io/badge/Version-2.0.0-10B981?style=flat-square)](https://github.com/danx123/smart-file-manager/releases)
 
-**[Overview](#-overview) · [Features](#-features) · [Installation](#-installation) · [Usage](#-usage) · [Smart Rename](#-smart-rename) · [Screenshots](#-screenshots) · [Contributing](#-contributing)**
+
 
 ---
 
