@@ -7,6 +7,7 @@ with smart rename, docking system, dark/light themes
 import sys
 import os
 import re
+import json
 import shutil
 import subprocess
 import platform
@@ -1941,9 +1942,531 @@ Use <b>Clear</b> to reset the log for the current session.
 }
 
 
-class HelpDialog(QDialog):
-    """Full help content dialog with sidebar navigation."""
+# ─────────────────────────────────────────────
+#  PRESET MANAGER — Rename Rule Templates
+# ─────────────────────────────────────────────
 
+DEFAULT_PRESETS = {
+    "Remove LK21 Tags": {
+        "rules": "LK21-DE, (2023)-, WEB-DL-, BluRay-, 720p-, 1080p-",
+        "prefix": "", "suffix": "", "case": 0,
+        "ext": "", "remove_special": False, "remove_spaces": False,
+        "space_rep": "_", "numbering": False, "num_start": 1,
+        "num_padding": 2, "num_sep": "_",
+        "regex_enabled": False, "regex_pattern": "", "regex_replace": "",
+        "description": "Strip common video release tags from filenames"
+    },
+    "Photos: Date Prefix": {
+        "rules": "",
+        "prefix": "2024-", "suffix": "", "case": 0,
+        "ext": "", "remove_special": False, "remove_spaces": True,
+        "space_rep": "_", "numbering": True, "num_start": 1,
+        "num_padding": 3, "num_sep": "_",
+        "regex_enabled": False, "regex_pattern": "", "regex_replace": "",
+        "description": "Add date prefix and sequence number to photo files"
+    },
+    "Clean Spaces → Underscore": {
+        "rules": "",
+        "prefix": "", "suffix": "", "case": 0,
+        "ext": "", "remove_special": False, "remove_spaces": True,
+        "space_rep": "_", "numbering": False, "num_start": 1,
+        "num_padding": 2, "num_sep": "_",
+        "regex_enabled": False, "regex_pattern": "", "regex_replace": "",
+        "description": "Replace all spaces with underscores"
+    },
+    "Lowercase Everything": {
+        "rules": "",
+        "prefix": "", "suffix": "", "case": 1,
+        "ext": "", "remove_special": False, "remove_spaces": False,
+        "space_rep": "_", "numbering": False, "num_start": 1,
+        "num_padding": 2, "num_sep": "_",
+        "regex_enabled": False, "regex_pattern": "", "regex_replace": "",
+        "description": "Convert all filenames to lowercase"
+    },
+    "Remove Special Characters": {
+        "rules": "",
+        "prefix": "", "suffix": "", "case": 0,
+        "ext": "", "remove_special": True, "remove_spaces": False,
+        "space_rep": "_", "numbering": False, "num_start": 1,
+        "num_padding": 2, "num_sep": "_",
+        "regex_enabled": False, "regex_pattern": "", "regex_replace": "",
+        "description": "Strip all non-alphanumeric characters"
+    },
+    "Sequential Numbering": {
+        "rules": "",
+        "prefix": "file_", "suffix": "", "case": 0,
+        "ext": "", "remove_special": False, "remove_spaces": False,
+        "space_rep": "_", "numbering": True, "num_start": 1,
+        "num_padding": 3, "num_sep": "",
+        "regex_enabled": False, "regex_pattern": "", "regex_replace": "",
+        "description": "Rename to file_001, file_002, ... sequence"
+    },
+    "Remove Year (Regex)": {
+        "rules": "",
+        "prefix": "", "suffix": "", "case": 0,
+        "ext": "", "remove_special": False, "remove_spaces": False,
+        "space_rep": "_", "numbering": False, "num_start": 1,
+        "num_padding": 2, "num_sep": "_",
+        "regex_enabled": True, "regex_pattern": r"\s*[\(\[]\d{4}[\)\]]",
+        "regex_replace": "",
+        "description": "Remove (2023) or [2023] year tags using regex"
+    },
+}
+
+
+class PresetManager:
+    """Manages rename rule presets stored in QSettings as JSON."""
+
+    SETTINGS_KEY = "presets/data"
+
+    def __init__(self, settings: QSettings):
+        self._settings = settings
+        self._presets: Dict[str, dict] = {}
+        self._load()
+
+    def _load(self):
+        raw = self._settings.value(self.SETTINGS_KEY, None)
+        if raw:
+            try:
+                self._presets = json.loads(raw)
+            except Exception:
+                self._presets = {}
+        # Inject defaults if not present
+        for name, data in DEFAULT_PRESETS.items():
+            if name not in self._presets:
+                self._presets[name] = data
+        self._save()
+
+    def _save(self):
+        self._settings.setValue(self.SETTINGS_KEY, json.dumps(self._presets))
+
+    def names(self) -> List[str]:
+        return sorted(self._presets.keys())
+
+    def get(self, name: str) -> Optional[dict]:
+        return self._presets.get(name)
+
+    def save(self, name: str, data: dict):
+        self._presets[name] = data
+        self._save()
+
+    def delete(self, name: str):
+        self._presets.pop(name, None)
+        self._save()
+
+    def rename(self, old_name: str, new_name: str):
+        if old_name in self._presets and new_name:
+            self._presets[new_name] = self._presets.pop(old_name)
+            self._save()
+
+
+class PresetManagerDialog(QDialog):
+    """Full preset management dialog: list, preview, new, rename, delete."""
+
+    preset_selected = Signal(dict)
+
+    def __init__(self, preset_mgr: "PresetManager", parent=None):
+        super().__init__(parent)
+        self.mgr = preset_mgr
+        self.setWindowTitle("Rename Preset Templates")
+        self.setMinimumSize(700, 480)
+        self._build()
+        self._refresh_list()
+
+    def _build(self):
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # ── Left: preset list ─────────────────────────────
+        left = QWidget()
+        left.setFixedWidth(240)
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(12, 12, 8, 12)
+        left_layout.setSpacing(6)
+
+        lbl = QLabel("SAVED PRESETS")
+        lbl.setObjectName("sectionTitle")
+        left_layout.addWidget(lbl)
+
+        self._list = QListView()
+        self._list_model = QStandardItemModel()
+        self._list.setModel(self._list_model)
+        self._list.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._list.setSpacing(2)
+        self._list.selectionModel().currentChanged.connect(self._on_select)
+        left_layout.addWidget(self._list)
+
+        btn_new = QPushButton("➕  New Preset")
+        btn_new.clicked.connect(self._new_preset)
+        left_layout.addWidget(btn_new)
+
+        layout.addWidget(left)
+
+        # Separator
+        sep = QFrame()
+        sep.setFrameShape(QFrame.VLine)
+        layout.addWidget(sep)
+
+        # ── Right: detail / actions ───────────────────────
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(16, 16, 16, 12)
+        right_layout.setSpacing(10)
+
+        self._name_lbl = QLabel("Select a preset")
+        self._name_lbl.setStyleSheet("font-size: 16px; font-weight: 700;")
+        right_layout.addWidget(self._name_lbl)
+
+        self._desc_lbl = QLabel("")
+        self._desc_lbl.setWordWrap(True)
+        self._desc_lbl.setStyleSheet("color: #64748B;")
+        right_layout.addWidget(self._desc_lbl)
+
+        grp = QGroupBox("Rule Summary")
+        grp_layout = QFormLayout(grp)
+        grp_layout.setSpacing(6)
+        self._r_rules = QLabel("")
+        self._r_rules.setWordWrap(True)
+        self._r_prefix = QLabel("")
+        self._r_suffix = QLabel("")
+        self._r_case = QLabel("")
+        self._r_numbering = QLabel("")
+        self._r_regex = QLabel("")
+        for label, widget in [
+            ("Find & Replace:", self._r_rules),
+            ("Prefix / Suffix:", self._r_prefix),
+            ("Case:", self._r_case),
+            ("Numbering:", self._r_numbering),
+            ("Regex:", self._r_regex),
+        ]:
+            lbl_w = QLabel(label)
+            lbl_w.setStyleSheet("font-weight: 600; color: #94A3B8;")
+            grp_layout.addRow(lbl_w, widget)
+        right_layout.addWidget(grp)
+
+        right_layout.addStretch()
+
+        # Action buttons
+        action_row = QHBoxLayout()
+        action_row.setSpacing(8)
+
+        self.btn_load = QPushButton("✅  Load Preset")
+        self.btn_load.setObjectName("primaryBtn")
+        self.btn_load.setEnabled(False)
+        self.btn_load.clicked.connect(self._load_preset)
+
+        self.btn_rename_p = QPushButton("✏️  Rename")
+        self.btn_rename_p.setEnabled(False)
+        self.btn_rename_p.clicked.connect(self._rename_preset)
+
+        self.btn_delete = QPushButton("🗑️  Delete")
+        self.btn_delete.setObjectName("dangerBtn")
+        self.btn_delete.setEnabled(False)
+        self.btn_delete.clicked.connect(self._delete_preset)
+
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(self.reject)
+
+        action_row.addWidget(self.btn_load)
+        action_row.addWidget(self.btn_rename_p)
+        action_row.addWidget(self.btn_delete)
+        action_row.addStretch()
+        action_row.addWidget(btn_close)
+        right_layout.addLayout(action_row)
+
+        layout.addWidget(right, 1)
+
+    def _refresh_list(self, select_name: str = ""):
+        self._list_model.clear()
+        for name in self.mgr.names():
+            item = QStandardItem(name)
+            item.setEditable(False)
+            preset = self.mgr.get(name)
+            if preset:
+                item.setToolTip(preset.get("description", ""))
+            self._list_model.appendRow(item)
+            if name == select_name:
+                self._list.setCurrentIndex(self._list_model.index(self._list_model.rowCount() - 1, 0))
+
+    def _on_select(self, current: QModelIndex, _):
+        name = current.data(Qt.DisplayRole)
+        if not name:
+            return
+        preset = self.mgr.get(name)
+        if not preset:
+            return
+        self._name_lbl.setText(name)
+        self._desc_lbl.setText(preset.get("description", ""))
+
+        case_labels = ["No Change", "lowercase", "UPPERCASE", "Title Case", "camelCase", "snake_case"]
+        case_idx = preset.get("case", 0)
+
+        self._r_rules.setText(preset.get("rules", "") or "(none)")
+        pre = preset.get("prefix", "")
+        suf = preset.get("suffix", "")
+        self._r_prefix.setText(f'"{pre}" / "{suf}"' if (pre or suf) else "(none)")
+        self._r_case.setText(case_labels[case_idx] if case_idx < len(case_labels) else "No Change")
+
+        num = preset.get("numbering", False)
+        if num:
+            self._r_numbering.setText(
+                f"Start {preset.get('num_start',1)}, pad {preset.get('num_padding',2)},"
+                f" sep '{preset.get('num_sep','_')}'"
+            )
+        else:
+            self._r_numbering.setText("Disabled")
+
+        if preset.get("regex_enabled"):
+            self._r_regex.setText(f"/{preset.get('regex_pattern','')}/ → {preset.get('regex_replace','')}")
+        else:
+            self._r_regex.setText("Disabled")
+
+        for btn in [self.btn_load, self.btn_rename_p, self.btn_delete]:
+            btn.setEnabled(True)
+
+    def _current_name(self) -> str:
+        idx = self._list.currentIndex()
+        return idx.data(Qt.DisplayRole) or ""
+
+    def _load_preset(self):
+        name = self._current_name()
+        preset = self.mgr.get(name)
+        if preset:
+            self.preset_selected.emit(preset)
+            self.accept()
+
+    def _new_preset(self):
+        name, ok = QInputDialog.getText(self, "New Preset", "Preset name:")
+        if ok and name:
+            if self.mgr.get(name):
+                QMessageBox.warning(self, "Exists", f"A preset named '{name}' already exists.")
+                return
+            self.mgr.save(name, {
+                "rules": "", "prefix": "", "suffix": "", "case": 0,
+                "ext": "", "remove_special": False, "remove_spaces": False,
+                "space_rep": "_", "numbering": False, "num_start": 1,
+                "num_padding": 2, "num_sep": "_",
+                "regex_enabled": False, "regex_pattern": "", "regex_replace": "",
+                "description": "Custom preset"
+            })
+            self._refresh_list(select_name=name)
+
+    def _rename_preset(self):
+        old = self._current_name()
+        new, ok = QInputDialog.getText(self, "Rename Preset", "New name:", text=old)
+        if ok and new and new != old:
+            self.mgr.rename(old, new)
+            self._refresh_list(select_name=new)
+
+    def _delete_preset(self):
+        name = self._current_name()
+        reply = QMessageBox.question(self, "Delete Preset", f"Delete preset '{name}'?",
+                                     QMessageBox.Yes | QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            self.mgr.delete(name)
+            self._refresh_list()
+            self._name_lbl.setText("Select a preset")
+            self._desc_lbl.setText("")
+            for w in [self._r_rules, self._r_prefix, self._r_case,
+                      self._r_numbering, self._r_regex]:
+                w.setText("")
+            for btn in [self.btn_load, self.btn_rename_p, self.btn_delete]:
+                btn.setEnabled(False)
+
+
+# ─────────────────────────────────────────────
+#  BOOKMARK MANAGER — Folder Favorites
+# ─────────────────────────────────────────────
+
+class BookmarkManager:
+    """Manages folder bookmarks stored in QSettings."""
+
+    SETTINGS_KEY = "bookmarks/data"
+
+    def __init__(self, settings: QSettings):
+        self._settings = settings
+        self._bookmarks: List[Dict] = []  # [{name, path, icon}]
+        self._load()
+
+    def _load(self):
+        raw = self._settings.value(self.SETTINGS_KEY, None)
+        if raw:
+            try:
+                self._bookmarks = json.loads(raw)
+            except Exception:
+                self._bookmarks = []
+
+    def _save(self):
+        self._settings.setValue(self.SETTINGS_KEY, json.dumps(self._bookmarks))
+
+    def all(self) -> List[Dict]:
+        return list(self._bookmarks)
+
+    def add(self, path: str, name: str = "", icon: str = "⭐"):
+        if not name:
+            name = Path(path).name or path
+        # Avoid duplicates by path
+        for bm in self._bookmarks:
+            if bm["path"] == path:
+                return False
+        self._bookmarks.append({"name": name, "path": path, "icon": icon})
+        self._save()
+        return True
+
+    def remove(self, path: str):
+        self._bookmarks = [b for b in self._bookmarks if b["path"] != path]
+        self._save()
+
+    def rename(self, path: str, new_name: str):
+        for bm in self._bookmarks:
+            if bm["path"] == path:
+                bm["name"] = new_name
+                break
+        self._save()
+
+    def move_up(self, index: int):
+        if index > 0:
+            self._bookmarks[index - 1], self._bookmarks[index] = \
+                self._bookmarks[index], self._bookmarks[index - 1]
+            self._save()
+
+    def move_down(self, index: int):
+        if index < len(self._bookmarks) - 1:
+            self._bookmarks[index], self._bookmarks[index + 1] = \
+                self._bookmarks[index + 1], self._bookmarks[index]
+            self._save()
+
+    def is_bookmarked(self, path: str) -> bool:
+        return any(b["path"] == path for b in self._bookmarks)
+
+
+class BookmarkWidget(QWidget):
+    """
+    Sidebar panel showing bookmarked folders.
+    Embedded inside the Explorer dock, below the drive tree.
+    """
+    navigate_requested = Signal(str)
+
+    def __init__(self, bm_mgr: "BookmarkManager", add_callback=None, parent=None):
+        super().__init__(parent)
+        self.mgr = bm_mgr
+        self._add_callback = add_callback  # callable: () -> None
+        self._build()
+
+    def _build(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # Header bar
+        header = QWidget()
+        header.setFixedHeight(32)
+        h_layout = QHBoxLayout(header)
+        h_layout.setContentsMargins(10, 0, 6, 0)
+        h_layout.setSpacing(4)
+
+        lbl = QLabel("⭐  BOOKMARKS")
+        lbl.setObjectName("sectionTitle")
+        h_layout.addWidget(lbl)
+        h_layout.addStretch()
+
+        btn_add = QPushButton("+")
+        btn_add.setFlat(True)
+        btn_add.setFixedSize(22, 22)
+        btn_add.setToolTip("Add current folder as bookmark")
+        btn_add.clicked.connect(self._add_from_parent)
+        btn_add.setStyleSheet(
+            "QPushButton { border-radius: 11px; font-weight: bold; color: #7C3AED; }"
+            "QPushButton:hover { background: rgba(124,58,237,0.15); }"
+        )
+        h_layout.addWidget(btn_add)
+        layout.addWidget(header)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        layout.addWidget(sep)
+
+        # Bookmark list
+        self._list = QListView()
+        self._list_model = QStandardItemModel()
+        self._list.setModel(self._list_model)
+        self._list.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._list.customContextMenuRequested.connect(self._context_menu)
+        self._list.doubleClicked.connect(self._on_double_click)
+        self._list.setSpacing(1)
+        self._list.setStyleSheet(
+            "QListView { border: none; background: transparent; }"
+            "QListView::item { height: 30px; padding-left: 8px; border-radius: 5px; margin: 1px 4px; }"
+            "QListView::item:hover { background: rgba(124,58,237,0.08); }"
+            "QListView::item:selected { background: rgba(124,58,237,0.18); color: #A78BFA; }"
+        )
+        layout.addWidget(self._list)
+
+        self.refresh()
+
+    def refresh(self):
+        self._list_model.clear()
+        for bm in self.mgr.all():
+            item = QStandardItem(f"  {bm.get('icon','⭐')}  {bm['name']}")
+            item.setEditable(False)
+            item.setData(bm["path"], Qt.UserRole)
+            item.setToolTip(bm["path"])
+            self._list_model.appendRow(item)
+
+    def _on_double_click(self, index: QModelIndex):
+        path = index.data(Qt.UserRole)
+        if path and os.path.isdir(path):
+            self.navigate_requested.emit(path)
+
+    def _add_from_parent(self):
+        if callable(self._add_callback):
+            self._add_callback()
+
+    def _context_menu(self, pos: QPoint):
+        index = self._list.indexAt(pos)
+        menu = QMenu(self)
+        if index.isValid():
+            path = index.data(Qt.UserRole)
+            row = index.row()
+            menu.addAction("📂  Open", lambda: self.navigate_requested.emit(path))
+            menu.addSeparator()
+            menu.addAction("⬆  Move Up", lambda: self._move(row, -1))
+            menu.addAction("⬇  Move Down", lambda: self._move(row, 1))
+            menu.addSeparator()
+            menu.addAction("✏️  Rename Bookmark", lambda: self._rename(path))
+            menu.addAction("📋  Copy Path", lambda: QApplication.clipboard().setText(path))
+            menu.addSeparator()
+            menu.addAction("🗑️  Remove Bookmark", lambda: self._remove(path))
+        else:
+            menu.addAction("➕  Add Bookmark…", self._add_from_parent)
+        menu.exec(self._list.viewport().mapToGlobal(pos))
+
+    def _move(self, index: int, direction: int):
+        if direction < 0:
+            self.mgr.move_up(index)
+        else:
+            self.mgr.move_down(index)
+        self.refresh()
+
+    def _remove(self, path: str):
+        self.mgr.remove(path)
+        self.refresh()
+
+    def _rename(self, path: str):
+        bm = next((b for b in self.mgr.all() if b["path"] == path), None)
+        if not bm:
+            return
+        new_name, ok = QInputDialog.getText(
+            self, "Rename Bookmark", "New name:", text=bm["name"]
+        )
+        if ok and new_name:
+            self.mgr.rename(path, new_name)
+            self.refresh()
+
+
+class HelpDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("SmartFileManager — Help")
@@ -2155,6 +2678,8 @@ class SmartFileManager(QMainWindow):
         self._clipboard_paths: List[str] = []
         self._clipboard_mode = "copy"  # or "cut"
         self._settings = QSettings("MacanAngkasa", "SmartFileManager")
+        self.preset_mgr = PresetManager(self._settings)
+        self.bookmark_mgr = BookmarkManager(self._settings)
 
         self.setWindowTitle("SmartFileManager — Enterprise Edition")
         self.setMinimumSize(1280, 800)
@@ -2164,7 +2689,6 @@ class SmartFileManager(QMainWindow):
             icon_path = os.path.join(sys._MEIPASS, icon_path)
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
-          
 
         self._build_ui()
         self._restore_settings()
@@ -2209,6 +2733,8 @@ class SmartFileManager(QMainWindow):
         self._build_status_bar()
         self._build_docks()
         self._build_central()
+        # Populate dynamic menus after all widgets exist
+        self._update_bookmark_menu()
 
     def _build_menu(self):
         mb = self.menuBar()
@@ -2266,6 +2792,10 @@ class SmartFileManager(QMainWindow):
         self._add_action(tools_menu, "Export Activity Log", None, self._export_log)
         self._add_action(tools_menu, "Export Report…", None, self._export_report)
         self._add_action(tools_menu, "Clear Activity Log", None, lambda: self.activity_log.clear())
+
+        # Bookmarks
+        self._bookmarks_menu = mb.addMenu("&Bookmarks")
+        # Populated dynamically; placeholder until _update_bookmark_menu is called after build
 
         # Help
         help_menu = mb.addMenu("&Help")
@@ -2340,6 +2870,15 @@ class SmartFileManager(QMainWindow):
         self.theme_btn.triggered.connect(self._toggle_theme)
         tb.addAction(self.theme_btn)
 
+        tb.addSeparator()
+
+        # Bookmark current folder
+        self.btn_bookmark = QAction("⭐  Bookmark", self)
+        self.btn_bookmark.setShortcut(QKeySequence("Ctrl+B"))
+        self.btn_bookmark.setToolTip("Bookmark / Unbookmark this folder (Ctrl+B)")
+        self.btn_bookmark.triggered.connect(self._toggle_bookmark_current)
+        tb.addAction(self.btn_bookmark)
+
     def _build_status_bar(self):
         sb = self.statusBar()
         self.status_path = QLabel("")
@@ -2358,12 +2897,21 @@ class SmartFileManager(QMainWindow):
         sb.addPermanentWidget(self.progress_bar)
 
     def _build_docks(self):
-        # ── Left Dock: Drive Tree ──────────────────────────
+        # ── Left Dock: Explorer (Drive Tree + Bookmarks) ───
         self.drive_dock = QDockWidget("Explorer", self)
         self.drive_dock.setObjectName("driveDock")
         self.drive_dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
         self.drive_dock.setMinimumWidth(240)
 
+        # Container with splitter: tree on top, bookmarks below
+        explorer_container = QWidget()
+        exp_layout = QVBoxLayout(explorer_container)
+        exp_layout.setContentsMargins(0, 0, 0, 0)
+        exp_layout.setSpacing(0)
+
+        exp_splitter = QSplitter(Qt.Vertical)
+
+        # Drive tree
         self.drive_tree = QTreeView()
         self.drive_tree.setHeaderHidden(True)
         self.drive_tree.setAnimated(True)
@@ -2376,7 +2924,16 @@ class SmartFileManager(QMainWindow):
         self.drive_tree.clicked.connect(self._on_tree_clicked)
         self.drive_tree.expandToDepth(0)
 
-        self.drive_dock.setWidget(self.drive_tree)
+        exp_splitter.addWidget(self.drive_tree)
+
+        # Bookmarks widget
+        self.bookmark_widget = BookmarkWidget(self.bookmark_mgr, add_callback=self._bookmark_add_current, parent=self)
+        self.bookmark_widget.navigate_requested.connect(self._navigate)
+        exp_splitter.addWidget(self.bookmark_widget)
+
+        exp_splitter.setSizes([400, 200])
+        exp_layout.addWidget(exp_splitter)
+        self.drive_dock.setWidget(explorer_container)
         self.addDockWidget(Qt.LeftDockWidgetArea, self.drive_dock)
 
         # ── Bottom Dock: Rename Panel ──────────────────────
@@ -2422,6 +2979,48 @@ class SmartFileManager(QMainWindow):
         layout = QVBoxLayout(w)
         layout.setSpacing(10)
         layout.setContentsMargins(12, 12, 12, 12)
+
+        # ── Preset toolbar ────────────────────────────────
+        preset_row = QHBoxLayout()
+        preset_row.setSpacing(6)
+
+        preset_icon = QLabel("🗂️")
+        preset_icon.setStyleSheet("font-size: 15px;")
+        preset_row.addWidget(preset_icon)
+
+        preset_lbl = QLabel("PRESET:")
+        preset_lbl.setObjectName("sectionTitle")
+        preset_row.addWidget(preset_lbl)
+
+        self.preset_combo = QComboBox()
+        self.preset_combo.setMinimumWidth(200)
+        self.preset_combo.setPlaceholderText("— Select a template —")
+        self._refresh_preset_combo()
+        preset_row.addWidget(self.preset_combo)
+
+        btn_load_preset = QPushButton("Load")
+        btn_load_preset.setMaximumHeight(28)
+        btn_load_preset.clicked.connect(self._load_preset_from_combo)
+        preset_row.addWidget(btn_load_preset)
+
+        btn_save_preset = QPushButton("Save as…")
+        btn_save_preset.setMaximumHeight(28)
+        btn_save_preset.setObjectName("successBtn")
+        btn_save_preset.clicked.connect(self._save_current_as_preset)
+        preset_row.addWidget(btn_save_preset)
+
+        btn_manage = QPushButton("⚙ Manage")
+        btn_manage.setMaximumHeight(28)
+        btn_manage.clicked.connect(self._open_preset_manager)
+        preset_row.addWidget(btn_manage)
+
+        preset_row.addStretch()
+        layout.addLayout(preset_row)
+
+        # Thin separator
+        preset_sep = QFrame()
+        preset_sep.setFrameShape(QFrame.HLine)
+        layout.addWidget(preset_sep)
 
         tabs = QTabWidget()
 
@@ -2706,6 +3305,7 @@ class SmartFileManager(QMainWindow):
         self._update_status()
         self._update_nav_buttons()
         self._update_rename_preview()
+        self._update_bookmark_btn()
 
         # Update file watcher
         self.file_watcher.removePaths(self.file_watcher.directories())
@@ -3213,6 +3813,12 @@ class SmartFileManager(QMainWindow):
         menu.addSeparator()
         menu.addAction("↻  Refresh", self._refresh)
         menu.addAction("💻  Open Terminal Here", self._open_terminal)
+        menu.addSeparator()
+        # Bookmark toggle
+        if self.bookmark_mgr.is_bookmarked(self.current_path):
+            menu.addAction("★  Remove Bookmark", self._bookmark_remove_current)
+        else:
+            menu.addAction("⭐  Bookmark This Folder", self._bookmark_add_current)
         
         menu.exec(self.file_table.viewport().mapToGlobal(pos))
 
@@ -3349,7 +3955,7 @@ class SmartFileManager(QMainWindow):
         h_layout.setContentsMargins(24, 16, 24, 16)
         title = QLabel("SmartFileManager")
         title.setStyleSheet("font-size: 22px; font-weight: 700; color: white; background: transparent;")
-        sub = QLabel("Enterprise Edition v2.0  •  Built with PySide6")
+        sub = QLabel("Enterprise Edition v2.5  •  Built with PySide6")
         sub.setStyleSheet("font-size: 12px; color: #A78BFA; background: transparent;")
         h_layout.addWidget(title)
         h_layout.addWidget(sub)
@@ -3400,16 +4006,163 @@ class SmartFileManager(QMainWindow):
         layout.addWidget(body)
         dlg.exec()
 
+    # ── PRESET METHODS ─────────────────────────────────────
+
+    def _refresh_preset_combo(self):
+        """Repopulate the preset combobox."""
+        self.preset_combo.clear()
+        for name in self.preset_mgr.names():
+            self.preset_combo.addItem(name)
+
+    def _load_preset_from_combo(self):
+        name = self.preset_combo.currentText()
+        if name:
+            preset = self.preset_mgr.get(name)
+            if preset:
+                self._apply_preset_to_ui(preset)
+                self.activity_log.log(f"Loaded preset: {name}", ActivityLog.INFO)
+
+    def _apply_preset_to_ui(self, preset: dict):
+        """Push preset values into all rename panel widgets."""
+        self.rule_input.setText(preset.get("rules", ""))
+        self.prefix_input.setText(preset.get("prefix", ""))
+        self.suffix_input.setText(preset.get("suffix", ""))
+        self.case_combo.setCurrentIndex(preset.get("case", 0))
+        self.ext_input.setText(preset.get("ext", ""))
+        self.chk_remove_special.setChecked(preset.get("remove_special", False))
+        self.chk_remove_spaces.setChecked(preset.get("remove_spaces", False))
+        self.space_rep.setText(preset.get("space_rep", "_"))
+        self.chk_numbering.setChecked(preset.get("numbering", False))
+        self.num_start.setText(str(preset.get("num_start", 1)))
+        self.num_padding.setText(str(preset.get("num_padding", 2)))
+        self.num_sep.setText(preset.get("num_sep", "_"))
+        self.chk_regex_enabled.setChecked(preset.get("regex_enabled", False))
+        self.regex_pattern.setText(preset.get("regex_pattern", ""))
+        self.regex_replace.setText(preset.get("regex_replace", ""))
+        self._update_rename_preview()
+
+    def _save_current_as_preset(self):
+        """Capture current rename UI state and save as a named preset."""
+        name, ok = QInputDialog.getText(self, "Save Preset", "Preset name:")
+        if not ok or not name:
+            return
+        desc, ok2 = QInputDialog.getText(self, "Description", "Short description (optional):")
+        preset = self._collect_preset_data()
+        preset["description"] = desc if ok2 else ""
+        self.preset_mgr.save(name, preset)
+        self._refresh_preset_combo()
+        # Select the newly saved preset
+        idx = self.preset_combo.findText(name)
+        if idx >= 0:
+            self.preset_combo.setCurrentIndex(idx)
+        self.activity_log.log(f"Preset saved: {name}", ActivityLog.SUCCESS)
+
+    def _collect_preset_data(self) -> dict:
+        """Read all rename panel fields and return as a dict."""
+        return {
+            "rules": self.rule_input.text(),
+            "prefix": self.prefix_input.text(),
+            "suffix": self.suffix_input.text(),
+            "case": self.case_combo.currentIndex(),
+            "ext": self.ext_input.text(),
+            "remove_special": self.chk_remove_special.isChecked(),
+            "remove_spaces": self.chk_remove_spaces.isChecked(),
+            "space_rep": self.space_rep.text(),
+            "numbering": self.chk_numbering.isChecked(),
+            "num_start": int(self.num_start.text() or 1),
+            "num_padding": int(self.num_padding.text() or 2),
+            "num_sep": self.num_sep.text(),
+            "regex_enabled": self.chk_regex_enabled.isChecked(),
+            "regex_pattern": self.regex_pattern.text(),
+            "regex_replace": self.regex_replace.text(),
+            "description": "",
+        }
+
+    def _open_preset_manager(self):
+        dlg = PresetManagerDialog(self.preset_mgr, self)
+        dlg.preset_selected.connect(self._apply_preset_to_ui)
+        dlg.exec()
+        self._refresh_preset_combo()
+
+    # ── BOOKMARK METHODS ───────────────────────────────────
+
+    def _toggle_bookmark_current(self):
+        """Toggle bookmark for current folder."""
+        if self.bookmark_mgr.is_bookmarked(self.current_path):
+            self._bookmark_remove_current()
+        else:
+            self._bookmark_add_current()
+        self._update_bookmark_btn()
+
+    def _update_bookmark_btn(self):
+        """Update toolbar bookmark button label based on current path."""
+        if not hasattr(self, "btn_bookmark"):
+            return
+        if self.bookmark_mgr.is_bookmarked(self.current_path):
+            self.btn_bookmark.setText("★  Bookmarked")
+        else:
+            self.btn_bookmark.setText("⭐  Bookmark")
+
+    def _bookmark_add_current(self):
+        """Add the current folder to bookmarks."""
+        path = self.current_path
+        if self.bookmark_mgr.is_bookmarked(path):
+            QMessageBox.information(self, "Bookmark", "This folder is already bookmarked.")
+            return
+        name, ok = QInputDialog.getText(
+            self, "Add Bookmark",
+            "Bookmark name:",
+            text=Path(path).name or path
+        )
+        if ok and name:
+            icon_choice, ok2 = QInputDialog.getItem(
+                self, "Bookmark Icon", "Choose icon:",
+                ["⭐", "📁", "❤️", "🔥", "💼", "🎯", "🏠", "🎬", "🎵", "📸", "🔧", "📦"],
+                0, False
+            )
+            icon = icon_choice if ok2 else "⭐"
+            added = self.bookmark_mgr.add(path, name, icon)
+            if added:
+                self.bookmark_widget.refresh()
+                self._update_bookmark_menu()
+                self.activity_log.log(f"Bookmarked: {name} → {path}", ActivityLog.SUCCESS)
+
+    def _bookmark_remove_current(self):
+        path = self.current_path
+        if self.bookmark_mgr.is_bookmarked(path):
+            self.bookmark_mgr.remove(path)
+            self.bookmark_widget.refresh()
+            self._update_bookmark_menu()
+            self.activity_log.log(f"Removed bookmark: {path}", ActivityLog.INFO)
+
+    def _update_bookmark_menu(self):
+        """Rebuild the Bookmarks menu dynamically."""
+        self._bookmarks_menu.clear()
+        self._add_action(self._bookmarks_menu, "⭐  Bookmark This Folder", "Ctrl+B",
+                         self._bookmark_add_current)
+        self._add_action(self._bookmarks_menu, "✖  Remove Bookmark", None,
+                         self._bookmark_remove_current)
+        self._bookmarks_menu.addSeparator()
+
+        bms = self.bookmark_mgr.all()
+        if bms:
+            for bm in bms:
+                label = f"{bm.get('icon','⭐')}  {bm['name']}"
+                action = self._bookmarks_menu.addAction(label)
+                action.setToolTip(bm["path"])
+                p = bm["path"]
+                action.triggered.connect(lambda _, path=p: self._navigate(path))
+        else:
+            empty = self._bookmarks_menu.addAction("(No bookmarks yet)")
+            empty.setEnabled(False)
+
     # ── LAYOUT RESET ──────────────────────────────────────
 
     def _reset_layout(self):
         """Restore all docks to default positions and show them."""
-        # Show all docks
         for dock, _ in self._dock_list:
             dock.setVisible(True)
             dock.setFloating(False)
-
-        # Re-add to default positions
         self.addDockWidget(Qt.LeftDockWidgetArea, self.drive_dock)
         self.addDockWidget(Qt.BottomDockWidgetArea, self.rename_dock)
         self.addDockWidget(Qt.RightDockWidgetArea, self.log_dock)
@@ -3434,7 +4187,7 @@ class SmartFileManager(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("SmartFileManager")
-    app.setApplicationVersion("2.0")
+    app.setApplicationVersion("2.5")
     app.setOrganizationName("MacanAngkasa")
     app.setOrganizationDomain("macanangkasa.com")
 
